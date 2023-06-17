@@ -45,7 +45,7 @@ fn main() {
     };
 
 
-    // Experiment start
+    // Initializing parameters - Capacity of hashtable, no of socket fibers, no of operations per request, no of trustees (no of shards)
     let mut capacity = 0;
     let mut no_of_fibers = 0;
     let mut ops_st = 0;
@@ -60,6 +60,8 @@ fn main() {
             Ok(stream) => stream,
             Err(_) => panic!("Cannot clone stream"),
         });
+
+        // Getting parameters
         let command = tcp_helper::read_setup(&mut stream, &mut reader);
         let command_units = command.split_whitespace().collect::<Vec<_>>();
         let trustees_no_command = command_units[0].to_owned();
@@ -67,6 +69,8 @@ fn main() {
         let no_of_fibers_command = command_units[2].to_owned();
         let ops_st_command = command_units[3].to_owned();
         println!("{} {} {} {}\n", trustees_no_command, capacity_command, no_of_fibers_command, ops_st_command);
+
+        // Setting parameters
         trustees_no = tcp_helper::convert_string_to_int(trustees_no_command);
         capacity = tcp_helper::convert_string_to_int(capacity_command);
         no_of_fibers = tcp_helper::convert_string_to_int(no_of_fibers_command);
@@ -89,6 +93,7 @@ fn main() {
         entrusted_tables.push(entrusted_table);
     }
 
+    // Prefilling hashtable
 
     let mut prefiller_streams = vec![];
     for stream in listener.incoming().take(no_of_fibers) {
@@ -122,26 +127,8 @@ fn main() {
         .collect::<Vec<_>>();
     
 
-    // let mut prefilling_fibers = vec![];
-    // let mut server_thread_index = 0;
-    // for stream in listener.incoming().take(no_of_fibers) {
-    //     let stream = match stream {
-    //         Ok(stream) => stream,
-    //         Err(_) => panic!("Cannot obtain stream"),
-    //     };
-    //     let mut thread_index = trustees_no + server_thread_index;
-        
-    //     let fiber = pool.workers[thread_index].trustee_ref.as_ref().unwrap().apply_with(|trustee, (entrusted_tables, ops_st)| 
-    //     {
-    //         let fiber = grt().spawn(move || {
-    //             process(stream, entrusted_tables.clone(), ops_st);
-    //         });
-    //         fiber
-    //     }, (entrusted_tables.clone(), ops_st));
-    //     prefilling_fibers.push(fiber);
-    //     server_thread_index = (server_thread_index + 1) % server_thread_count;
-    // }
 
+    // Doing work on hashtables
 
     let mut work_streams = vec![];
     for stream in listener.incoming().take(no_of_fibers) {
@@ -174,41 +161,13 @@ fn main() {
         .map(|jh| jh.join())
         .collect::<Vec<_>>();
     
-
-
-
-    // let mut work_fibers = vec![];
-    // let mut server_thread_index = 0;
-    // for stream in listener.incoming().take(no_of_fibers) {
-    //     println!("getting stream");
-    //     let stream = match stream {
-    //         Ok(stream) => stream,
-    //         Err(_) => panic!("Cannot obtain stream"),
-    //     };
-
-    //     let mut thread_index = trustees_no + server_thread_index;
-    //     let fiber = pool.workers[thread_index].trustee_ref.as_ref().unwrap().apply_with(|trustee, (entrusted_tables, ops_st)| 
-    //     {
-    //         let fiber = grt().spawn(move || {
-    //             process(stream, entrusted_tables.clone(), ops_st);
-    //         });
-    //         fiber
-    //     }, (entrusted_tables.clone(), ops_st));
-
-    //     work_fibers.push(fiber);
-    //     server_thread_index = (server_thread_index + 1) % server_thread_count;
-    // }
-
-    
-    // work_fibers
-    //     .into_iter()
-    //     .map(|jh| jh.join())
-    //     .collect::<Vec<_>>();
     drop(entrusted_tables);
     drop(pool);
     println!("Experiment done");
 }
 
+
+// Process function that gets operations in the TCP Stream and performs operations on the shards
 fn process(mut stream: TcpStream, entrusted_tables: Vec<Trust<HashMap<u64, u64>>>, ops_st: usize) {
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(stream) => stream,
