@@ -6,6 +6,7 @@ mod tcp_helper;
 
 
 use csv::{Writer, WriterBuilder};
+use dashmap::DashMap;
 use serde::{Serialize, Deserialize};
 /* enum command-line parsing stuff */
 use ::trust::*;
@@ -64,10 +65,10 @@ fn main() {
         // Getting parameters
         let command = tcp_helper::read_setup(&mut stream, &mut reader);
         let command_units = command.split_whitespace().collect::<Vec<_>>();
-        let trustees_no_command = command_units[0].to_owned();
-        let capacity_command = command_units[1].to_owned();
-        let no_of_fibers_command = command_units[2].to_owned();
-        let ops_st_command = command_units[3].to_owned();
+        let capacity_command = command_units[0].to_owned();
+        let no_of_fibers_command = command_units[1].to_owned();
+        let ops_st_command = command_units[2].to_owned();
+        let trustees_no_command = command_units[3].to_owned();
         println!("{} {} {} {}\n", trustees_no_command, capacity_command, no_of_fibers_command, ops_st_command);
 
         // Setting parameters
@@ -83,18 +84,22 @@ fn main() {
         process::exit(1);
     }
 
-    let server_thread_count = num_cores_available - trustees_no;
-
+    // No extra work on main thread of the program
+    let main_thread_index = 0;
     // Entrusting the hashtables for server threads
     let mut entrusted_tables = vec![];
     for table_thread_index in 0..trustees_no {
-        let mut table:HashMap<u64, u64> = HashMap::with_capacity(capacity);
-        let entrusted_table = pool.workers[table_thread_index].trustee().entrust(table);
+        // let mut table:HashMap<u64, u64> = HashMap::with_capacity(1 << capacity);
+        let mut table  = DashMap::with_capacity(1 << capacity);
+        println!("Trusting in thread {}", table_thread_index + 1);
+        let entrusted_table = pool.workers[table_thread_index + 1].trustee().entrust(table);
         entrusted_tables.push(entrusted_table);
     }
+    
+
+    let server_thread_count = num_cores_available - trustees_no - 1;
 
     // Prefilling hashtable
-
     let mut prefiller_streams = vec![];
     for stream in listener.incoming().take(no_of_fibers) {
         let stream = match stream {
@@ -108,8 +113,8 @@ fn main() {
     let mut server_thread_index = 0;
 
     for stream in prefiller_streams {
-        let mut thread_index = trustees_no + server_thread_index;
-        
+        let mut thread_index = trustees_no + 1 + server_thread_index;
+        println!("Processing in thread {}", thread_index);
         let fiber = pool.workers[thread_index].trustee_ref.as_ref().unwrap().apply_with(|trustee, (entrusted_tables, ops_st)| 
         {
             let fiber = grt().spawn(move || {
@@ -129,7 +134,6 @@ fn main() {
 
 
     // Doing work on hashtables
-
     let mut work_streams = vec![];
     for stream in listener.incoming().take(no_of_fibers) {
         let stream = match stream {
@@ -143,12 +147,12 @@ fn main() {
     let mut server_thread_index = 0;
 
     for stream in work_streams {
-        let mut thread_index = trustees_no + server_thread_index;
-        
+        let mut thread_index = trustees_no + 1 + server_thread_index;
+        println!("Processing in thread {}", thread_index);
         let fiber = pool.workers[thread_index].trustee_ref.as_ref().unwrap().apply_with(|trustee, (entrusted_tables, ops_st)| 
         {
             let fiber = grt().spawn(move || {
-                process(stream, entrusted_tables.clone(), ops_st);
+                process(stream, entrusted_tables.clone(), ops_st)
             });
             fiber
         }, (entrusted_tables.clone(), ops_st));
@@ -168,7 +172,7 @@ fn main() {
 
 
 // Process function that gets operations in the TCP Stream and performs operations on the shards
-fn process(mut stream: TcpStream, entrusted_tables: Vec<Trust<HashMap<u64, u64>>>, ops_st: usize) {
+fn process(mut stream: TcpStream, entrusted_tables: Vec<Trust<DashMap<u64, u64>>>, ops_st: usize){
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(stream) => stream,
         Err(_) => panic!("Cannot clone stream"),
