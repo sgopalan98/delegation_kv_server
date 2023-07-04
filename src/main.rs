@@ -8,13 +8,16 @@ mod tcp_helper;
 use csv::{Writer, WriterBuilder};
 use dashmap::DashMap;
 use serde::{Serialize, Deserialize};
+use serde::de::DeserializeOwned;
 /* enum command-line parsing stuff */
 use ::trust::*;
 use ::trust::green::*;
 use structopt::StructOpt;
+use std::collections::hash_map::DefaultHasher;
 use std::fmt::format;
 use std::fs::OpenOptions;
-use std::io::{BufReader, Write};
+use std::hash::{Hash, Hasher};
+use std::io::{BufReader, Write, Read};
 use std::net::{TcpListener, TcpStream};
 use std::process;
 use std::ptr::hash;
@@ -26,9 +29,36 @@ use ::trust::thenjoin::*;
 use rand::{distributions::{Distribution,Uniform}, seq::SliceRandom, RngCore};
 
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HandShakeRequest {
+    client_threads: usize,
+    server_threads: usize,
+    ops_per_req: usize,
+    capacity: usize,
+    key_type: KeyValueType,
+    value_type: KeyValueType
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Eq, Hash, PartialEq)]
+pub enum KeyValueType {
+    Int(u64),
+    String(String),
+    // Add more types as needed
+}
+
+fn receive_request<T: DeserializeOwned>(mut stream: &TcpStream) -> T {
+    let mut buffer = [0; 1024];
+    let bytes_read = stream.read(&mut buffer).unwrap();
+    let request_json = String::from_utf8_lossy(&buffer[..bytes_read]).into_owned();
+    // println!("request json: {}", request_json);
+    let result = serde_json::from_str(&request_json).unwrap();
+    // println!("done");
+    return result;
+}
+
 
 fn main() {
-
 
     let num_cores_available = num_cpus::get();
 
@@ -49,7 +79,7 @@ fn main() {
     // Initializing parameters - Capacity of hashtable, no of socket fibers, no of operations per request, no of trustees (no of shards)
     let mut capacity = 0;
     let mut no_of_fibers = 0;
-    let mut ops_st = 0;
+    let mut ops_per_req = 0;
     let mut trustees_no = 0;
 
     for stream in listener.incoming().take(1) {
@@ -62,20 +92,11 @@ fn main() {
             Err(_) => panic!("Cannot clone stream"),
         });
 
-        // Getting parameters
-        let command = tcp_helper::read_setup(&mut stream, &mut reader);
-        let command_units = command.split_whitespace().collect::<Vec<_>>();
-        let capacity_command = command_units[0].to_owned();
-        let no_of_fibers_command = command_units[1].to_owned();
-        let ops_st_command = command_units[2].to_owned();
-        let trustees_no_command = command_units[3].to_owned();
-        println!("{} {} {} {}\n", trustees_no_command, capacity_command, no_of_fibers_command, ops_st_command);
-
-        // Setting parameters
-        trustees_no = tcp_helper::convert_string_to_int(trustees_no_command);
-        capacity = tcp_helper::convert_string_to_int(capacity_command);
-        no_of_fibers = tcp_helper::convert_string_to_int(no_of_fibers_command);
-        ops_st = tcp_helper::convert_string_to_int(ops_st_command);
+        let handshake_request: HandShakeRequest = receive_request(&stream);
+        capacity = handshake_request.capacity;
+        no_of_fibers = handshake_request.client_threads;
+        ops_per_req = handshake_request.ops_per_req;
+        trustees_no = handshake_request.server_threads;
     }
 
 
@@ -115,13 +136,13 @@ fn main() {
     for stream in prefiller_streams {
         let mut thread_index = trustees_no + 1 + server_thread_index;
         println!("Processing in thread {}", thread_index);
-        let fiber = pool.workers[thread_index].trustee_ref.as_ref().unwrap().apply_with(|trustee, (entrusted_tables, ops_st)| 
+        let fiber = pool.workers[thread_index].trustee_ref.as_ref().unwrap().apply_with(|trustee, (entrusted_tables)| 
         {
             let fiber = grt().spawn(move || {
-                process(stream, entrusted_tables.clone(), ops_st);
+                process(stream, entrusted_tables.clone());
             });
             fiber
-        }, (entrusted_tables.clone(), ops_st));
+        }, (entrusted_tables.clone()));
         prefilling_fibers.push(fiber);
         server_thread_index = (server_thread_index + 1) % server_thread_count;
     }
@@ -149,13 +170,13 @@ fn main() {
     for stream in work_streams {
         let mut thread_index = trustees_no + 1 + server_thread_index;
         println!("Processing in thread {}", thread_index);
-        let fiber = pool.workers[thread_index].trustee_ref.as_ref().unwrap().apply_with(|trustee, (entrusted_tables, ops_st)| 
+        let fiber = pool.workers[thread_index].trustee_ref.as_ref().unwrap().apply_with(|trustee, (entrusted_tables)| 
         {
             let fiber = grt().spawn(move || {
-                process(stream, entrusted_tables.clone(), ops_st)
+                process(stream, entrusted_tables.clone())
             });
             fiber
-        }, (entrusted_tables.clone(), ops_st));
+        }, (entrusted_tables.clone()));
         work_fibers.push(fiber);
         server_thread_index = (server_thread_index + 1) % server_thread_count;
     }
@@ -171,96 +192,160 @@ fn main() {
 }
 
 
+#[derive(Debug, Serialize, Deserialize)]
+enum Operation {
+    Read { key: KeyValueType },
+    Insert { key: KeyValueType, value: KeyValueType },
+    Remove { key: KeyValueType },
+    Increment { key: KeyValueType },
+    Close
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Request {
+    operations: Vec<Operation>,
+}
+
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OperationResults {
+    results: Vec<OperationResult>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum OperationResult {
+    ReadSuccess(KeyValueType),
+    ReadFailure(String),
+    InsertNew(KeyValueType),
+    InsertOld(KeyValueType),
+    RemoveSuccess(KeyValueType),
+    RemoveFailure(String),
+    IncrementSuccess(KeyValueType),
+    IncrementFailure(String),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum ResultData {
+    String(String),
+    Int(i32),
+    // Add more types as needed
+}
+
+// Function to hash a string and return a number within the specified range
+fn hash_str(value: &str, range: usize) -> usize {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    let hash = hasher.finish();
+    hash as usize % range
+}
+
+
+fn send_request<T: Serialize>(stream: &mut TcpStream, request: &T) {
+    let request_json = serde_json::to_string(&request).expect("Failed to serialize request");
+    stream.write_all(request_json.as_bytes()).expect("Failed to send request");
+}
+
 // Process function that gets operations in the TCP Stream and performs operations on the shards
-fn process(mut stream: TcpStream, entrusted_tables: Vec<Trust<DashMap<u64, u64>>>, ops_st: usize){
-    let mut reader = BufReader::new(match stream.try_clone() {
-        Ok(stream) => stream,
-        Err(_) => panic!("Cannot clone stream"),
-    });
+fn process(mut stream: TcpStream, entrusted_tables: Vec<Trust<DashMap<KeyValueType, KeyValueType>>>,){
     loop {
-        let command_u8s = tcp_helper::read_command(&mut stream, &mut reader, ops_st);
+        let request: Request = receive_request(&stream);
+        let mut results = Vec::new();
 
-        if command_u8s.len() == 0 {
-            println!("Not receiving anything");
-            continue;
-        }
-        let mut error_codes = vec![0u8; ops_st];
-        let mut done = 0;
-        for index in 0..ops_st {
-            let start_index = 9 * index;
-            let end_index = 9 * index + 9;
-            let operation = command_u8s[start_index];
-            let key_u8s = &command_u8s[(start_index + 1)..end_index];
-            let key = u64::from_be_bytes(
-                match key_u8s.try_into() {
-                    Ok(key) => key,
-                    Err(_) => panic!("Cannot convert slice to array"),
-                },
-            );
-            let tables_length = entrusted_tables.len();
-            let shard_index = key as usize % tables_length;
-            let shard = &entrusted_tables[shard_index];
+        for operation in request.operations {
+            let result = match operation {
+                
 
-            let error_code: u8;
-            // CLOSE
-            if operation == 0 {
-                done = 1;
-                break;
-            }
-            // GET
-            else if operation == 1 {
-                let error_code = shard.apply(move |hashmap| {
-                    let result = hashmap.get(&key);
-                    result.is_some()
-                });
-                let error_code_byte = match error_code {
-                    true => 0,
-                    false => 1
-                };
-                error_codes[index] = error_code_byte;
-            }
-            // INSERT
-            else if operation == 2 {
-                let error_code = shard.apply(move |hashmap| {
-                    let result = hashmap.insert(key, 0);
-                    result.is_none()
-                });
-                let error_code_byte = match error_code {
-                    true => 0,
-                    false => 1
-                };
-                error_codes[index] = error_code_byte;
-            }
-            // REMOVE
-            else if operation == 3 {
-                let error_code = shard.apply(move |hashmap| {
-                    let result = hashmap.remove(&key);
-                    result.is_some()
-                });
-                let error_code_byte = match error_code {
-                    true => 0,
-                    false => 1
-                };
-                error_codes[index] = error_code_byte;
-            }
-            // UPDATE
-            else if operation == 4 {
-                let error_code = shard.apply(move |hashmap| {
-                    hashmap.get_mut(&key).map(|mut v| *v += 1).is_some()
-                });
-                let error_code_byte = match error_code {
-                    true => 0,
-                    false => 1
-                };
-                error_codes[index] = error_code_byte;
-            } 
-            else {
+                Operation::Read { key } => {
+                    let tables_length = entrusted_tables.len();
+                    let key_index = match key {
+                        KeyValueType::Int(key_index) => key_index as usize,
+                        KeyValueType::String(ref string_value) => hash_str(&string_value, tables_length),
+                    };
+                    let shard_index = key_index as usize % tables_length;
+                    let shard = &entrusted_tables[shard_index];
+                    let result = shard.apply_with(move |hashmap, key| {
+                        let result = hashmap.get(&key);
+                        match result {
+                            Some(value) => OperationResult::ReadSuccess(value.clone()),
+                            None => OperationResult::ReadFailure(String::from("Key does not exist")),
+                        }
+                    }, key);
+                    result
+                }
+
+
+                Operation::Insert { key, value } => {
+                    let tables_length = entrusted_tables.len();
+                    let key_index = match key {
+                        KeyValueType::Int(key_index) => key_index as usize,
+                        KeyValueType::String(ref string_value) => hash_str(&string_value, tables_length),
+                    };
+                    let shard_index = key_index as usize % tables_length;
+                    let shard = &entrusted_tables[shard_index];
+                    let result = shard.apply_with(move |hashmap, (key, value)| {
+                        let result = hashmap.insert(key, value.clone());
+                        match result {
+                            Some(old_value) => OperationResult::InsertOld(old_value),
+                            None => OperationResult::InsertNew(value),
+                        }
+                    }, (key, value));
+                    result
+                }
+
+
+                Operation::Remove { key } => {
+                    let tables_length = entrusted_tables.len();
+                    let key_index = match key {
+                        KeyValueType::Int(key_index) => key_index as usize,
+                        KeyValueType::String(ref string_value) => hash_str(&string_value, tables_length),
+                    };
+                    let shard_index = key_index as usize % tables_length;
+                    let shard = &entrusted_tables[shard_index];
+
+                    let result = shard.apply_with(move |hashmap, key| {
+                        let result = hashmap.remove(&key);
+                        match result {
+                            Some((key, value)) => OperationResult::RemoveSuccess(value.clone()),
+                            None => OperationResult::RemoveFailure(String::from("Key does not exist")),
+                        }
+                    }, key);
+                    result
+                }
+
+                Operation::Increment { key } => {
+                    let tables_length = entrusted_tables.len();
+                    let key_index = match key {
+                        KeyValueType::Int(key_index) => key_index as usize,
+                        KeyValueType::String(ref string_value) => hash_str(&string_value, tables_length),
+                    };
+                    let shard_index = key_index as usize % tables_length;
+                    let shard = &entrusted_tables[shard_index];
+
+                    let result = shard.apply_with(move |hashmap, key| {
+                        match hashmap.get_mut(&key) {
+                            Some(entry) => {
+                                match *entry {
+                                    KeyValueType::Int(mut value) => {
+                                        value = value + 1;
+                                        OperationResult::IncrementSuccess(KeyValueType::Int(value + 1))
+                                    },
+                                    KeyValueType::String(_) => OperationResult::IncrementFailure(String::from("Value is not an integer")),
+                                }
+                            }
+                            None => OperationResult::IncrementFailure(String::from("Key does not exist")),
+                        }
+                    }, key);
+                    result
+
+                }
+                Operation::Close => return,
+            };
             
-            }
+            results.push(result);
         }
-        stream.write(&error_codes);
-        if done == 1 {
-            return;
-        }
+        let operation_results = OperationResults{
+            results
+        };
+        send_request(&mut stream, &operation_results);
     }
 }
