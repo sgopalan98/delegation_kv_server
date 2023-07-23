@@ -48,7 +48,7 @@ pub enum KeyValueType {
 }
 
 fn receive_request<T: DeserializeOwned>(mut stream: &TcpStream) -> T {
-    let mut buffer = [0; 1024];
+    let mut buffer = [0; 1024 * 10];
     let bytes_read = stream.read(&mut buffer).unwrap();
     let request_json = String::from_utf8_lossy(&buffer[..bytes_read]).into_owned();
     // println!("request json: {}", request_json);
@@ -64,9 +64,6 @@ fn main() {
 
 
     println!("The number of cores available is {}", num_cores_available);
-    // Creating the thread pool - with the num cores available
-    let mut pool = ThreadPool::configure(num_cores_available, CpuAllocationStrategy::Compact);
-    println!("Created pool");
 
     // Start server
     let address = "0.0.0.0:7879";
@@ -93,7 +90,7 @@ fn main() {
         });
 
         let handshake_request: HandShakeRequest = receive_request(&stream);
-        capacity = handshake_request.capacity;
+        capacity = 1 << handshake_request.capacity;
         no_of_fibers = handshake_request.client_threads;
         ops_per_req = handshake_request.ops_per_req;
         trustees_no = handshake_request.server_threads;
@@ -105,13 +102,20 @@ fn main() {
         process::exit(1);
     }
 
+    // Creating the thread pool - with the num cores available
+    let num_cores_for_trustees = 1 + trustees_no;
+    let num_cores_for_network = no_of_fibers;
+    let num_cores_to_allocate = num_cores_available.min(num_cores_for_trustees + num_cores_for_network);
+    let mut pool = ThreadPool::configure(num_cores_to_allocate, CpuAllocationStrategy::Compact);
+    println!("Allocated pool with {} CPUs", num_cores_to_allocate);
+
     // No extra work on main thread of the program
     let main_thread_index = 0;
     // Entrusting the hashtables for server threads
     let mut entrusted_tables = vec![];
     for table_thread_index in 0..trustees_no {
         // let mut table:HashMap<u64, u64> = HashMap::with_capacity(1 << capacity);
-        let mut table  = DashMap::with_capacity(1 << capacity);
+        let mut table  = DashMap::with_capacity(capacity / no_of_fibers);
         println!("Trusting in thread {}", table_thread_index + 1);
         let entrusted_table = pool.workers[table_thread_index + 1].trustee().entrust(table);
         entrusted_tables.push(entrusted_table);
@@ -215,6 +219,7 @@ struct OperationResults {
 #[derive(Debug, Serialize, Deserialize)]
 enum OperationResult {
     ReadSuccess(KeyValueType),
+    KeyDoesntExist,
     ReadFailure(String),
     InsertNew(KeyValueType),
     InsertOld(KeyValueType),
@@ -263,11 +268,11 @@ fn process(mut stream: TcpStream, entrusted_tables: Vec<Trust<DashMap<KeyValueTy
                     };
                     let shard_index = key_index as usize % tables_length;
                     let shard = &entrusted_tables[shard_index];
-                    let result = shard.apply_with(move |hashmap, key| {
+                    let result = shard.lazy_apply_with(move |hashmap, key| {
                         let result = hashmap.get(&key);
                         match result {
                             Some(value) => OperationResult::ReadSuccess(value.clone()),
-                            None => OperationResult::ReadFailure(String::from("Key does not exist")),
+                            None => OperationResult::KeyDoesntExist,
                         }
                     }, key);
                     result
@@ -282,7 +287,7 @@ fn process(mut stream: TcpStream, entrusted_tables: Vec<Trust<DashMap<KeyValueTy
                     };
                     let shard_index = key_index as usize % tables_length;
                     let shard = &entrusted_tables[shard_index];
-                    let result = shard.apply_with(move |hashmap, (key, value)| {
+                    let result = shard.lazy_apply_with(move |hashmap, (key, value)| {
                         let result = hashmap.insert(key, value.clone());
                         match result {
                             Some(old_value) => OperationResult::InsertOld(old_value),
@@ -302,11 +307,11 @@ fn process(mut stream: TcpStream, entrusted_tables: Vec<Trust<DashMap<KeyValueTy
                     let shard_index = key_index as usize % tables_length;
                     let shard = &entrusted_tables[shard_index];
 
-                    let result = shard.apply_with(move |hashmap, key| {
+                    let result = shard.lazy_apply_with(move |hashmap, key| {
                         let result = hashmap.remove(&key);
                         match result {
                             Some((key, value)) => OperationResult::RemoveSuccess(value.clone()),
-                            None => OperationResult::RemoveFailure(String::from("Key does not exist")),
+                            None => OperationResult::KeyDoesntExist,
                         }
                     }, key);
                     result
@@ -321,7 +326,7 @@ fn process(mut stream: TcpStream, entrusted_tables: Vec<Trust<DashMap<KeyValueTy
                     let shard_index = key_index as usize % tables_length;
                     let shard = &entrusted_tables[shard_index];
 
-                    let result = shard.apply_with(move |hashmap, key| {
+                    let result = shard.lazy_apply_with(move |hashmap, key| {
                         match hashmap.get_mut(&key) {
                             Some(entry) => {
                                 match *entry {
@@ -332,7 +337,7 @@ fn process(mut stream: TcpStream, entrusted_tables: Vec<Trust<DashMap<KeyValueTy
                                     KeyValueType::String(_) => OperationResult::IncrementFailure(String::from("Value is not an integer")),
                                 }
                             }
-                            None => OperationResult::IncrementFailure(String::from("Key does not exist")),
+                            None => OperationResult::KeyDoesntExist,
                         }
                     }, key);
                     result
@@ -343,8 +348,13 @@ fn process(mut stream: TcpStream, entrusted_tables: Vec<Trust<DashMap<KeyValueTy
             
             results.push(result);
         }
+        let final_results = results.iter().map(|result| {
+            let value = result.join();
+            value
+        }).collect();
+
         let operation_results = OperationResults{
-            results
+            results: final_results,
         };
         send_request(&mut stream, &operation_results);
     }
