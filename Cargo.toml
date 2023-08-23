@@ -28,7 +28,7 @@ dashmap = "5.0.0"
 
 
 [dependencies.trust]
-path = "../../rust-delegation/trust"
+path = "../../../../rust-delegation/trust"
 version = "0.1.0"
 
 [profile.dev]
@@ -38,10 +38,7 @@ lto = false
 debug-assertions=true
 
 [profile.release]
-opt-level = 3
 debug = true
-debug-assertions = true
-lto = true
 
 [[bin]]
 name="server"

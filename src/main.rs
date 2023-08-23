@@ -17,7 +17,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::fmt::format;
 use std::fs::OpenOptions;
 use std::hash::{Hash, Hasher};
-use std::io::{BufReader, Write, Read};
+use std::io::{BufReader, Write, Read, self};
 use std::net::{TcpListener, TcpStream};
 use std::process;
 use std::ptr::hash;
@@ -43,11 +43,11 @@ pub struct HandShakeRequest {
 #[derive(Eq, Hash, PartialEq)]
 pub enum KeyValueType {
     Int(u64),
-    String(String),
+    // String(String),
     // Add more types as needed
 }
 
-fn receive_request<T: DeserializeOwned>(mut stream: &TcpStream) -> T {
+fn receive_request_block<T: DeserializeOwned>(mut stream: &TcpStream) -> T {
     let mut buffer = [0; 1024 * 10];
     let bytes_read = stream.read(&mut buffer).unwrap();
     let request_json = String::from_utf8_lossy(&buffer[..bytes_read]).into_owned();
@@ -55,6 +55,21 @@ fn receive_request<T: DeserializeOwned>(mut stream: &TcpStream) -> T {
     let result = serde_json::from_str(&request_json).unwrap();
     // println!("done");
     return result;
+}
+
+fn receive_request_nonblock<T: DeserializeOwned>(mut stream: &TcpStream) -> Result<T, bool> {
+    let mut buffer = [0; 1024 * 10];
+    let mut read_result = stream.read(&mut buffer);
+    let receive_result = match read_result {
+        Ok(bytes) => {
+            let request_json = String::from_utf8_lossy(&buffer[..bytes]).into_owned();
+            // println!("The JSON is {}", request_json);
+            let result = serde_json::from_str(&request_json).unwrap();
+            Ok(result)
+        },
+        Err(_) => Err(false),
+    };
+    return receive_result;
 }
 
 
@@ -89,8 +104,9 @@ fn main() {
             Err(_) => panic!("Cannot clone stream"),
         });
 
-        let handshake_request: HandShakeRequest = receive_request(&stream);
-        capacity = 1 << handshake_request.capacity;
+        let handshake_request: HandShakeRequest = receive_request_block(&stream);
+        println!("{}", handshake_request.capacity);
+        capacity = handshake_request.capacity;
         no_of_fibers = handshake_request.client_threads;
         ops_per_req = handshake_request.ops_per_req;
         trustees_no = handshake_request.server_threads;
@@ -138,6 +154,7 @@ fn main() {
     let mut server_thread_index = 0;
 
     for stream in prefiller_streams {
+        stream.set_nonblocking(true);
         let mut thread_index = trustees_no + 1 + server_thread_index;
         println!("Processing in thread {}", thread_index);
         let fiber = pool.workers[thread_index].trustee_ref.as_ref().unwrap().apply_with(|trustee, (entrusted_tables)| 
@@ -172,6 +189,7 @@ fn main() {
     let mut server_thread_index = 0;
 
     for stream in work_streams {
+        stream.set_nonblocking(true);
         let mut thread_index = trustees_no + 1 + server_thread_index;
         println!("Processing in thread {}", thread_index);
         let fiber = pool.workers[thread_index].trustee_ref.as_ref().unwrap().apply_with(|trustee, (entrusted_tables)| 
@@ -218,15 +236,8 @@ struct OperationResults {
 
 #[derive(Debug, Serialize, Deserialize)]
 enum OperationResult {
-    ReadSuccess(KeyValueType),
-    KeyDoesntExist,
-    ReadFailure(String),
-    InsertNew(KeyValueType),
-    InsertOld(KeyValueType),
-    RemoveSuccess(KeyValueType),
-    RemoveFailure(String),
-    IncrementSuccess(KeyValueType),
-    IncrementFailure(String),
+    Success(KeyValueType),
+    Failure
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -253,7 +264,12 @@ fn send_request<T: Serialize>(stream: &mut TcpStream, request: &T) {
 // Process function that gets operations in the TCP Stream and performs operations on the shards
 fn process(mut stream: TcpStream, entrusted_tables: Vec<Trust<DashMap<KeyValueType, KeyValueType>>>,){
     loop {
-        let request: Request = receive_request(&stream);
+        let request_result:Result<Request, bool> = receive_request_nonblock(&stream);
+        if request_result.is_err() {
+            grt().yield_now();
+            continue;
+        }
+        let request = request_result.unwrap();
         let mut results = Vec::new();
 
         for operation in request.operations {
@@ -264,15 +280,15 @@ fn process(mut stream: TcpStream, entrusted_tables: Vec<Trust<DashMap<KeyValueTy
                     let tables_length = entrusted_tables.len();
                     let key_index = match key {
                         KeyValueType::Int(key_index) => key_index as usize,
-                        KeyValueType::String(ref string_value) => hash_str(&string_value, tables_length),
+                        // KeyValueType::String(ref string_value) => hash_str(&string_value, tables_length),
                     };
                     let shard_index = key_index as usize % tables_length;
                     let shard = &entrusted_tables[shard_index];
                     let result = shard.lazy_apply_with(move |hashmap, key| {
                         let result = hashmap.get(&key);
                         match result {
-                            Some(value) => OperationResult::ReadSuccess(value.clone()),
-                            None => OperationResult::KeyDoesntExist,
+                            Some(value) => OperationResult::Success(value.clone()),
+                            None => OperationResult::Failure,
                         }
                     }, key);
                     result
@@ -283,15 +299,15 @@ fn process(mut stream: TcpStream, entrusted_tables: Vec<Trust<DashMap<KeyValueTy
                     let tables_length = entrusted_tables.len();
                     let key_index = match key {
                         KeyValueType::Int(key_index) => key_index as usize,
-                        KeyValueType::String(ref string_value) => hash_str(&string_value, tables_length),
+                        // KeyValueType::String(ref string_value) => hash_str(&string_value, tables_length),
                     };
                     let shard_index = key_index as usize % tables_length;
                     let shard = &entrusted_tables[shard_index];
                     let result = shard.lazy_apply_with(move |hashmap, (key, value)| {
                         let result = hashmap.insert(key, value.clone());
                         match result {
-                            Some(old_value) => OperationResult::InsertOld(old_value),
-                            None => OperationResult::InsertNew(value),
+                            Some(old_value) => OperationResult::Success(old_value),
+                            None => OperationResult::Success(value),
                         }
                     }, (key, value));
                     result
@@ -302,7 +318,7 @@ fn process(mut stream: TcpStream, entrusted_tables: Vec<Trust<DashMap<KeyValueTy
                     let tables_length = entrusted_tables.len();
                     let key_index = match key {
                         KeyValueType::Int(key_index) => key_index as usize,
-                        KeyValueType::String(ref string_value) => hash_str(&string_value, tables_length),
+                        // KeyValueType::String(ref string_value) => hash_str(&string_value, tables_length),
                     };
                     let shard_index = key_index as usize % tables_length;
                     let shard = &entrusted_tables[shard_index];
@@ -310,8 +326,8 @@ fn process(mut stream: TcpStream, entrusted_tables: Vec<Trust<DashMap<KeyValueTy
                     let result = shard.lazy_apply_with(move |hashmap, key| {
                         let result = hashmap.remove(&key);
                         match result {
-                            Some((key, value)) => OperationResult::RemoveSuccess(value.clone()),
-                            None => OperationResult::KeyDoesntExist,
+                            Some((key, value)) => OperationResult::Success(value.clone()),
+                            None => OperationResult::Failure,
                         }
                     }, key);
                     result
@@ -321,7 +337,7 @@ fn process(mut stream: TcpStream, entrusted_tables: Vec<Trust<DashMap<KeyValueTy
                     let tables_length = entrusted_tables.len();
                     let key_index = match key {
                         KeyValueType::Int(key_index) => key_index as usize,
-                        KeyValueType::String(ref string_value) => hash_str(&string_value, tables_length),
+                        // KeyValueType::String(ref string_value) => hash_str(&string_value, tables_length),
                     };
                     let shard_index = key_index as usize % tables_length;
                     let shard = &entrusted_tables[shard_index];
@@ -332,12 +348,12 @@ fn process(mut stream: TcpStream, entrusted_tables: Vec<Trust<DashMap<KeyValueTy
                                 match *entry {
                                     KeyValueType::Int(mut value) => {
                                         value = value + 1;
-                                        OperationResult::IncrementSuccess(KeyValueType::Int(value + 1))
+                                        OperationResult::Success(KeyValueType::Int(value + 1))
                                     },
-                                    KeyValueType::String(_) => OperationResult::IncrementFailure(String::from("Value is not an integer")),
+                                    // KeyValueType::String(_) => OperationResult::IncrementFailure(String::from("Value is not an integer")),
                                 }
                             }
-                            None => OperationResult::KeyDoesntExist,
+                            None => OperationResult::Failure,
                         }
                     }, key);
                     result
