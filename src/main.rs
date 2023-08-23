@@ -237,7 +237,7 @@ struct OperationResults {
 #[derive(Debug, Serialize, Deserialize)]
 enum OperationResult {
     Success(KeyValueType),
-    Failure
+    Failure(String)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -288,7 +288,7 @@ fn process(mut stream: TcpStream, entrusted_tables: Vec<Trust<DashMap<KeyValueTy
                         let result = hashmap.get(&key);
                         match result {
                             Some(value) => OperationResult::Success(value.clone()),
-                            None => OperationResult::Failure,
+                            None => OperationResult::Failure("".to_string()),
                         }
                     }, key);
                     result
@@ -327,7 +327,7 @@ fn process(mut stream: TcpStream, entrusted_tables: Vec<Trust<DashMap<KeyValueTy
                         let result = hashmap.remove(&key);
                         match result {
                             Some((key, value)) => OperationResult::Success(value.clone()),
-                            None => OperationResult::Failure,
+                            None => OperationResult::Failure("".to_string()),
                         }
                     }, key);
                     result
@@ -353,7 +353,7 @@ fn process(mut stream: TcpStream, entrusted_tables: Vec<Trust<DashMap<KeyValueTy
                                     // KeyValueType::String(_) => OperationResult::IncrementFailure(String::from("Value is not an integer")),
                                 }
                             }
-                            None => OperationResult::Failure,
+                            None => OperationResult::Failure("".to_string()),
                         }
                     }, key);
                     result
