@@ -50,8 +50,6 @@ pub enum KeyValueType {
 fn receive_request_block<T: DeserializeOwned>(mut stream: &TcpStream) -> T {
     let mut buffer = [0; 1024 * 10];
     let bytes_read = stream.read(&mut buffer).unwrap();
-    // let response_json = String::from_utf8_lossy(&buffer[..bytes_read]).into_owned();
-    // serde_json::from_str(&response_json).unwrap()
     let response = bincode::deserialize(&buffer).unwrap();
     return response;
 }
@@ -61,8 +59,6 @@ fn receive_request_nonblock<T: DeserializeOwned>(mut stream: &TcpStream) -> Resu
     let mut read_result = stream.read(&mut buffer);
     let receive_result = match read_result {
         Ok(bytes) => {
-            // let request_json = String::from_utf8_lossy(&buffer[..bytes]).into_owned();
-            // let result = serde_json::from_str(&request_json).unwrap();
             let result = bincode::deserialize(&buffer).unwrap();
             Ok(result)
         },
