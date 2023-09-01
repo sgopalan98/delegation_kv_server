@@ -50,11 +50,10 @@ pub enum KeyValueType {
 fn receive_request_block<T: DeserializeOwned>(mut stream: &TcpStream) -> T {
     let mut buffer = [0; 1024 * 10];
     let bytes_read = stream.read(&mut buffer).unwrap();
-    let request_json = String::from_utf8_lossy(&buffer[..bytes_read]).into_owned();
-    // println!("request json: {}", request_json);
-    let result = serde_json::from_str(&request_json).unwrap();
-    // println!("done");
-    return result;
+    // let response_json = String::from_utf8_lossy(&buffer[..bytes_read]).into_owned();
+    // serde_json::from_str(&response_json).unwrap()
+    let response = bincode::deserialize(&buffer).unwrap();
+    return response;
 }
 
 fn receive_request_nonblock<T: DeserializeOwned>(mut stream: &TcpStream) -> Result<T, bool> {
@@ -62,9 +61,9 @@ fn receive_request_nonblock<T: DeserializeOwned>(mut stream: &TcpStream) -> Resu
     let mut read_result = stream.read(&mut buffer);
     let receive_result = match read_result {
         Ok(bytes) => {
-            let request_json = String::from_utf8_lossy(&buffer[..bytes]).into_owned();
-            // println!("The JSON is {}", request_json);
-            let result = serde_json::from_str(&request_json).unwrap();
+            // let request_json = String::from_utf8_lossy(&buffer[..bytes]).into_owned();
+            // let result = serde_json::from_str(&request_json).unwrap();
+            let result = bincode::deserialize(&buffer).unwrap();
             Ok(result)
         },
         Err(_) => Err(false),
@@ -257,8 +256,8 @@ fn hash_str(value: &str, range: usize) -> usize {
 
 
 fn send_request<T: Serialize>(stream: &mut TcpStream, request: &T) {
-    let request_json = serde_json::to_string(&request).expect("Failed to serialize request");
-    stream.write_all(request_json.as_bytes()).expect("Failed to send request");
+    let request_bytes = bincode::serialize(&request).unwrap();
+    stream.write_all(&request_bytes).expect("Failed to send request");
 }
 
 // Process function that gets operations in the TCP Stream and performs operations on the shards
@@ -366,6 +365,7 @@ fn process(mut stream: TcpStream, entrusted_tables: Vec<Trust<DashMap<KeyValueTy
         }
         let final_results = results.iter().map(|result| {
             let value = result.join();
+            // println!("The size is {:?}", OperationResult::static_size());
             value
         }).collect();
 
